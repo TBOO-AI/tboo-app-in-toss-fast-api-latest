@@ -2,8 +2,17 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import select, text
 from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import SQLAlchemyError, OperationalError
+from fastapi import HTTPException, status
 import os
 from dotenv import load_dotenv
+
+# asyncpg 예외 처리
+try:
+    import asyncpg
+    ASYNCPG_AVAILABLE = True
+except ImportError:
+    ASYNCPG_AVAILABLE = False
 
 # 환경 변수 로드
 load_dotenv()
@@ -66,14 +75,65 @@ async def get_db():
             await db.refresh(db_item)
             return db_item
     """
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+    try:
+        async with AsyncSessionLocal() as session:
+            try:
+                yield session
+            except SQLAlchemyError as e:
+                await session.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"데이터베이스 작업 중 오류가 발생했습니다: {str(e)}"
+                )
+            except Exception as e:
+                await session.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"예상치 못한 오류가 발생했습니다: {str(e)}"
+                )
+            finally:
+                await session.close()
+    except Exception as e:
+        # 데이터베이스 연결 자체가 실패한 경우
+        error_msg = str(e)
+        error_type = type(e).__name__
+        
+        # asyncpg 예외 처리
+        if ASYNCPG_AVAILABLE and isinstance(e, (asyncpg.exceptions.InvalidAuthorizationSpecificationError,
+                                                asyncpg.exceptions.InvalidPasswordError,
+                                                asyncpg.exceptions.InvalidCatalogNameError)):
+            if "does not exist" in error_msg or "role" in error_msg.lower():
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="데이터베이스 연결에 실패했습니다. 데이터베이스 사용자 또는 설정을 확인해주세요."
+                )
+            elif "password" in error_msg.lower():
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="데이터베이스 인증에 실패했습니다. 비밀번호를 확인해주세요."
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"데이터베이스 연결 오류: {error_msg}"
+                )
+        
+        # 일반적인 연결 오류 처리
+        if "does not exist" in error_msg or "role" in error_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="데이터베이스 연결에 실패했습니다. 데이터베이스 사용자 또는 설정을 확인해주세요."
+            )
+        elif "connection" in error_msg.lower() or "refused" in error_msg.lower() or "Connection" in error_type:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="데이터베이스 서버에 연결할 수 없습니다. 데이터베이스가 실행 중인지 확인해주세요."
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"데이터베이스 연결 오류: {error_msg}"
+            )
 
 
 # 데이터베이스 연결 확인 함수
@@ -85,7 +145,16 @@ async def ping_db():
                 "select current_user, current_database(), inet_server_addr(), inet_server_port();"
             ))).one()
             print(f"✅ [DB] connected as user={row[0]} db={row[1]} host={row[2]} port={row[3]}")
+            return True
     except Exception as e:
-        print(f"❌ [DB] 연결 실패: {e}")
-        raise
+        error_msg = str(e)
+        if "does not exist" in error_msg or "role" in error_msg.lower():
+            print(f"⚠️  [DB] 연결 실패: 데이터베이스 사용자가 존재하지 않습니다. (오류: {error_msg})")
+        elif "connection" in error_msg.lower() or "refused" in error_msg.lower():
+            print(f"⚠️  [DB] 연결 실패: 데이터베이스 서버에 연결할 수 없습니다. (오류: {error_msg})")
+        else:
+            print(f"⚠️  [DB] 연결 실패: {error_msg}")
+        # 애플리케이션은 계속 실행되도록 예외를 다시 발생시키지 않음
+        # 대신 False를 반환하여 연결 실패를 알림
+        return False
 

@@ -14,13 +14,28 @@ from models import user, item
 async def lifespan(app: FastAPI):
     # 시작 시 실행
     # 1. 데이터베이스 연결 확인
-    await ping_db()
-    # 2. 비동기 테이블 생성
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    db_connected = await ping_db()
+    
+    # 2. 비동기 테이블 생성 (연결 성공 시에만)
+    if db_connected:
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            print("✅ [DB] 테이블 생성 완료")
+        except Exception as e:
+            print(f"⚠️  [DB] 테이블 생성 실패: {e}")
+    else:
+        print("⚠️  [DB] 데이터베이스 연결 실패로 테이블 생성을 건너뜁니다.")
+        print("⚠️  [DB] API는 실행되지만 데이터베이스 작업은 실패할 수 있습니다.")
+    
     yield
+    
     # 종료 시 실행
-    await engine.dispose()
+    try:
+        await engine.dispose()
+        print("✅ [DB] 연결 종료 완료")
+    except Exception as e:
+        print(f"⚠️  [DB] 연결 종료 중 오류: {e}")
 
 
 app = FastAPI(
