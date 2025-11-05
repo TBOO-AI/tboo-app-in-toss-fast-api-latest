@@ -1,12 +1,38 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from contextlib import asynccontextmanager
+
+from db.database import engine, Base, ping_db
+from api.v1 import users, items
+
+# 모델들을 import하여 테이블 생성에 포함되도록 함
+from models import user, item
+
+
+# 애플리케이션 시작 시 데이터베이스 테이블 생성
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 시작 시 실행
+    # 1. 데이터베이스 연결 확인
+    await ping_db()
+    # 2. 비동기 테이블 생성
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    # 종료 시 실행
+    await engine.dispose()
 
 
 app = FastAPI(
     title="Vercel + FastAPI",
     description="Vercel + FastAPI",
     version="1.0.0",
+    lifespan=lifespan,
 )
+
+# API 라우터 등록
+app.include_router(users.router, prefix="/api/v1")
+app.include_router(items.router, prefix="/api/v1")
 
 
 @app.get("/api/data")

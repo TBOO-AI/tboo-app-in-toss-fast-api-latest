@@ -1,2 +1,8 @@
 fastapi
 uvicorn
+sqlalchemy>=2.0
+asyncpg
+greenlet
+alembic
+pydantic-settings
+python-dotenv
