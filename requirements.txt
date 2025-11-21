@@ -2,6 +2,7 @@ fastapi
 uvicorn
 sqlalchemy>=2.0
 asyncpg
+psycopg2-binary
 greenlet
 alembic
 pydantic-settings

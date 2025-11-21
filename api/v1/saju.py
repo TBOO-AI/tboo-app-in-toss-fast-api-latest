@@ -3,7 +3,11 @@ import datetime
 from functools import cached_property
 from zoneinfo import ZoneInfo
 
-from app.solar_term.models import SolarTerm, SolarTermKindChoices, SolarTermNameChoices
+from sqlalchemy import select, extract
+from sqlalchemy.orm import Session
+
+from db.database import sync_engine
+from models.solar_term import SolarTerm, SolarTermKindChoices, SolarTermNameChoices
 
 
 def sin_sal(name):
@@ -18,6 +22,55 @@ def sin_sal(name):
 
 stem_list = ["갑", "을", "병", "정", "무", "기", "경", "신", "임", "계"]
 branch_list = ["자", "축", "인", "묘", "진", "사", "오", "미", "신", "유", "술", "해"]
+
+
+def _get_ipchun_for_year(year: int) -> SolarTerm | None:
+    """해당 연도의 입춘(절기) SolarTerm 레코드를 반환합니다."""
+    if sync_engine is None:
+        raise Exception("동기 데이터베이스 엔진이 초기화되지 않았습니다. psycopg2-binary를 설치하세요.")
+    with Session(sync_engine) as session:
+        stmt = (
+            select(SolarTerm)
+            .where(
+                SolarTerm.name == SolarTermNameChoices.IPCHUN.value,
+                extract("year", SolarTerm.at) == year,
+                SolarTerm.kind == SolarTermKindChoices.JEOLGI.value,
+            )
+            .order_by(SolarTerm.at.asc())
+        )
+        return session.execute(stmt).scalars().first()
+
+
+def _get_previous_jeolgi(before_dt: datetime.datetime) -> SolarTerm | None:
+    """특정 시각 이전의 가장 가까운 절기 SolarTerm 레코드를 반환합니다."""
+    if sync_engine is None:
+        raise Exception("동기 데이터베이스 엔진이 초기화되지 않았습니다. psycopg2-binary를 설치하세요.")
+    with Session(sync_engine) as session:
+        stmt = (
+            select(SolarTerm)
+            .where(
+                SolarTerm.kind == SolarTermKindChoices.JEOLGI.value,
+                SolarTerm.at < before_dt,
+            )
+            .order_by(SolarTerm.at.desc())
+        )
+        return session.execute(stmt).scalars().first()
+
+
+def _get_next_jeolgi(after_dt: datetime.datetime) -> SolarTerm | None:
+    """특정 시각 이후의 가장 가까운 절기 SolarTerm 레코드를 반환합니다."""
+    if sync_engine is None:
+        raise Exception("동기 데이터베이스 엔진이 초기화되지 않았습니다. psycopg2-binary를 설치하세요.")
+    with Session(sync_engine) as session:
+        stmt = (
+            select(SolarTerm)
+            .where(
+                SolarTerm.kind == SolarTermKindChoices.JEOLGI.value,
+                SolarTerm.at > after_dt,
+            )
+            .order_by(SolarTerm.at.asc())
+        )
+        return session.execute(stmt).scalars().first()
 
 # stem_to_color = {
 #     "甲": "green",
@@ -512,7 +565,7 @@ class Saju:
         print("표준시: ", self.standard_longitude)
         print("출생지 경도: ", self.birth_longitude)
         print("경도조정: ", int(self.offset_minutes.total_seconds() / 60))
-        print("기준시각", self.birth - self.birth.dst() + self.offset_minutes)
+        print("기준시각", self.birth - self._get_dst_offset() + self.offset_minutes)
         print("사주: ")
         for k, v in self.stem_branch.items():
             print(k)
@@ -537,9 +590,14 @@ class Saju:
         if start_at > birth or birth > end_at:
             raise Exception("지원하지 않는 연도입니다.")
 
+    def _get_dst_offset(self):
+        """DST 오프셋을 안전하게 반환 (None이면 timedelta(0) 반환)"""
+        dst_offset = self.birth.dst()
+        return dst_offset if dst_offset is not None else datetime.timedelta(0)
+
     @cached_property
     def standard_longitude(self):
-        standard_offset = self.birth.utcoffset() - self.birth.dst()
+        standard_offset = self.birth.utcoffset() - self._get_dst_offset()
         offset_hours = standard_offset.total_seconds() / 3600
         standard_longitude = offset_hours * 15
         return standard_longitude
@@ -635,7 +693,9 @@ class Saju:
 
     @cached_property
     def year_stem_branch(self):
-        solar_term = SolarTerm.objects.get(name=SolarTermNameChoices.IPCHUN, at__year=self.birth.year)
+        solar_term = _get_ipchun_for_year(self.birth.year)
+        if solar_term is None:
+            raise Exception(f"{self.birth.year}년 입춘 절기 데이터를 찾을 수 없습니다.")
         birth_year = self.birth.year
         if solar_term.at >= self.birth:
             birth_year -= 1
@@ -657,9 +717,9 @@ class Saju:
             str: 월주 간지 (예: "정묘")
         """
         # 생일 이전의 가장 가까운 절기 찾기(표준시, 써머타임 적용)
-        previous_jeolgi = (
-            SolarTerm.objects.filter(at__lt=self.birth, kind=SolarTermKindChoices.JEOLGI).order_by("-at").first()
-        )
+        previous_jeolgi = _get_previous_jeolgi(self.birth)
+        if previous_jeolgi is None:
+            raise Exception("생일 이전 절기 데이터를 찾을 수 없습니다.")
 
         month_branch = jeolgi_to_branch[previous_jeolgi.name]
         if not month_branch:
@@ -684,7 +744,7 @@ class Saju:
     @cached_property
     def day_stem_branch(self):
         base_date = datetime.date(1924, 2, 15)  # 갑자일
-        birth = self.birth - self.birth.dst() + self.offset_minutes
+        birth = self.birth - self._get_dst_offset() + self.offset_minutes
         # 23시인 경우 다음날로 처리 (자시는 23시-01시이므로 23시는 다음날 자시로 계산)
         if birth.hour == 23:
             birth += datetime.timedelta(days=1)
@@ -708,7 +768,7 @@ class Saju:
             str: 시주 간지 (예: "갑자")
         """
         # 시간에 따른 지지 결정 (2시간씩, 써머타임 조정)
-        hour = (self.birth - self.birth.dst() + self.offset_minutes).hour
+        hour = (self.birth - self._get_dst_offset() + self.offset_minutes).hour
 
         hour_branch = hour_to_branch[hour]
 
@@ -740,16 +800,23 @@ class Saju:
         # 카운트 초기화
         five_elements_count = {"목": 0, "화": 0, "토": 0, "금": 0, "수": 0}
 
-        # 사주팔자 각 자리별 오행과 음양 계산
-        for i in range(0, 8, 2):  # 0, 2, 4, 6 (시주, 일주, 월주, 년주)
-            stem = self.stem_branch[i]  # 천간
-            branch = self.stem_branch[i + 1]  # 지지
+        # 사주팔자 각 자리별 오행 계산
+        pillars = [
+            ("hour", self.hour_stem_branch),
+            ("day", self.day_stem_branch),
+            ("month", self.month_stem_branch),
+            ("year", self.year_stem_branch),
+        ]
 
-            # 천간 오행 및 음양 추가
+        for pillar_name, stem_branch_str in pillars:
+            stem = stem_branch_str[0]  # 천간
+            branch = stem_branch_str[1]  # 지지
+
+            # 천간 오행 추가
             if stem in stem_to_five_elements:
                 five_elements_count[stem_to_five_elements[stem]] += 1
 
-            # 지지 오행 및 음양 추가
+            # 지지 오행 추가
             if branch in branch_to_five_elements:
                 five_elements_count[branch_to_five_elements[branch]] += 1
 
@@ -761,24 +828,31 @@ class Saju:
         사주팔자의 음양 분포를 계산합니다.
 
         Returns:
-            dict: 오행별 개수
+            dict: 음양별 개수
             {"음": 2, "양": 1}
         """
 
         # 카운트 초기화
         yin_yang_count = {"양": 0, "음": 0}
 
-        # 사주팔자 각 자리별 오행과 음양 계산
-        for i in range(0, 8, 2):  # 0, 2, 4, 6 (시주, 일주, 월주, 년주)
-            stem = self.stem_branch[i]  # 천간
-            branch = self.stem_branch[i + 1]  # 지지
+        # 사주팔자 각 자리별 음양 계산
+        pillars = [
+            ("hour", self.hour_stem_branch),
+            ("day", self.day_stem_branch),
+            ("month", self.month_stem_branch),
+            ("year", self.year_stem_branch),
+        ]
 
-            # 천간 오행 및 음양 추가
-            if stem in stem_to_five_elements:
+        for pillar_name, stem_branch_str in pillars:
+            stem = stem_branch_str[0]  # 천간
+            branch = stem_branch_str[1]  # 지지
+
+            # 천간 음양 추가
+            if stem in stem_to_yin_yang:
                 yin_yang_count[stem_to_yin_yang[stem]] += 1
 
-            # 지지 오행 및 음양 추가
-            if branch in branch_to_five_elements:
+            # 지지 음양 추가
+            if branch in branch_to_yin_yang:
                 yin_yang_count[branch_to_yin_yang[branch]] += 1
 
         return yin_yang_count
@@ -1456,16 +1530,16 @@ class Saju:
         """
         if self.is_forward:
             # 순행: 생일 이후 첫 번째 절기까지의 일수
-            next_solar_term = (
-                SolarTerm.objects.filter(at__gt=self.birth, kind=SolarTermKindChoices.JEOLGI).order_by("at").first()
-            )
+            next_solar_term = _get_next_jeolgi(self.birth)
+            if next_solar_term is None:
+                raise Exception("생일 이후 절기 데이터를 찾을 수 없습니다.")
 
             days_diff = (next_solar_term.at.date() - self.birth.date()).days
         else:
             # 역행: 생일 이전 가장 가까운 절기부터의 일수
-            prev_solar_term = (
-                SolarTerm.objects.filter(at__lt=self.birth, kind=SolarTermKindChoices.JEOLGI).order_by("-at").first()
-            )
+            prev_solar_term = _get_previous_jeolgi(self.birth)
+            if prev_solar_term is None:
+                raise Exception("생일 이전 절기 데이터를 찾을 수 없습니다.")
 
             days_diff = (self.birth.date() - prev_solar_term.at.date()).days
 

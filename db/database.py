@@ -1,4 +1,5 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import select, text
 from sqlalchemy.engine.url import make_url
@@ -18,11 +19,15 @@ except ImportError:
 load_dotenv()
 
 # 데이터베이스 URL 구성 (비동기용 asyncpg 드라이버 사용)
-DATABASE_URL = os.getenv(
+DATABASE_URL_ORIGINAL = os.getenv(
     "DATABASE_URL",
 )
 
-# postgresql:// → postgresql+asyncpg:// 변환
+# 원본 URL 저장 (동기 엔진용)
+SYNC_DATABASE_URL = DATABASE_URL_ORIGINAL
+
+# 비동기용 URL 변환 (postgresql:// → postgresql+asyncpg://)
+DATABASE_URL = DATABASE_URL_ORIGINAL
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
@@ -41,6 +46,32 @@ engine = create_async_engine(
     max_overflow=20,
     echo=True  # SQL 쿼리 로깅 활성화
 )
+
+# 동기 SQLAlchemy 엔진 생성 (saju.py 등에서 사용)
+# postgresql+asyncpg:// → postgresql+psycopg2:// 변환
+sync_database_url = SYNC_DATABASE_URL
+if sync_database_url.startswith("postgresql+asyncpg://"):
+    sync_database_url = sync_database_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://", 1)
+elif sync_database_url.startswith("postgresql://"):
+    # psycopg2 사용 시도
+    try:
+        import psycopg2
+        sync_database_url = sync_database_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    except ImportError:
+        # psycopg2가 없으면 기본 postgresql:// 사용 (psycopg2 설치 필요)
+        print("⚠️  [DB] psycopg2가 설치되지 않았습니다. 동기 엔진 사용을 위해 'pip install psycopg2-binary'를 실행하세요.")
+
+try:
+    sync_engine = create_engine(
+        sync_database_url,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        echo=False  # 동기 엔진은 로깅 비활성화 (비동기 엔진만 로깅)
+    )
+except Exception as e:
+    print(f"⚠️  [DB] 동기 엔진 생성 실패: {e}")
+    sync_engine = None
 
 # 비동기 세션 팩토리 생성
 AsyncSessionLocal = async_sessionmaker(

@@ -1,33 +1,102 @@
+import csv
+import datetime
+import os
+
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 
-from db.database import engine, Base, ping_db
-from api.v1 import users, items
+from sqlalchemy import select, func as sa_func
+
+from db.database import engine, Base, ping_db, AsyncSessionLocal
+from api.v1 import users, items, saju_api
 
 # 모델들을 import하여 테이블 생성에 포함되도록 함
-from models import user, item
+from models import user, item, solar_term
 
 
-# 애플리케이션 시작 시 데이터베이스 테이블 생성
+async def seed_solar_terms_if_empty():
+    """
+    애플리케이션 최초 실행 시에만 `solar_term.csv`를 읽어
+    `solar_terms` 테이블을 채웁니다.
+
+    - 테이블에 이미 데이터가 1건이라도 있으면 아무 것도 하지 않습니다.
+    - CSV 파일이 없으면 조용히 건너뜁니다.
+    """
+    csv_path = os.path.join(os.path.dirname(__file__), "solar_term.csv")
+    if not os.path.exists(csv_path):
+        print("⚠️  [DB] solar_term.csv 파일을 찾을 수 없어 시드를 건너뜁니다.")
+        return
+
+    from models.solar_term import SolarTerm, SolarTermKindChoices
+
+    async with AsyncSessionLocal() as session:
+        # 이미 데이터가 있는지 확인
+        result = await session.execute(sa_func.count(SolarTerm.id))
+        count = result.scalar_one()
+        if count and count > 0:
+            print(f"ℹ️  [DB] solar_terms 테이블에 이미 {count}건의 데이터가 있어 시드를 건너뜁니다.")
+            return
+
+        rows = []
+        try:
+            with open(csv_path, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    # CSV 컬럼: id, created_at, updated_at, name, kind(절기/중기), at
+                    if len(row) < 6:
+                        continue
+                    _, _created_at, _updated_at, name, kind_kr, at_str = row
+
+                    # 사주 계산에서 사용하는 것은 '절기'만이므로, 우선 절기만 넣습니다.
+                    if kind_kr == "절기":
+                        kind = SolarTermKindChoices.JEOLGI.value
+                    else:
+                        # 필요하면 중기도 나중에 확장 가능
+                        continue
+
+                    try:
+                        at = datetime.datetime.fromisoformat(at_str.strip())
+                    except ValueError:
+                        # 파싱 실패 시 해당 행만 건너뜀
+                        continue
+
+                    rows.append(SolarTerm(name=name, kind=kind, at=at))
+        except Exception as e:
+            print(f"⚠️  [DB] solar_term.csv 읽기 중 오류: {e}")
+            return
+
+        if not rows:
+            print("⚠️  [DB] solar_term.csv 에서 삽입할 유효한 절기 데이터가 없습니다.")
+            return
+
+        session.add_all(rows)
+        await session.commit()
+        print(f"✅ [DB] solar_terms 시드 완료 (삽입 {len(rows)}건)")
+
+
+# 애플리케이션 시작 시 데이터베이스 테이블 생성 및 초기 데이터 시드
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 시작 시 실행
     # 1. 데이터베이스 연결 확인
     db_connected = await ping_db()
-    
+
     # 2. 비동기 테이블 생성 (연결 성공 시에만)
     if db_connected:
         try:
             async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            print("✅ [DB] 테이블 생성 완료")
+                print("✅ [DB] 테이블 생성 완료")
+                # await conn.run_sync(Base.metadata.create_all)
+
+            # 3. 테이블 생성 이후, solar_terms가 비어 있으면 CSV로 시드
+            # await seed_solar_terms_if_empty()
         except Exception as e:
-            print(f"⚠️  [DB] 테이블 생성 실패: {e}")
+            print(f"⚠️  [DB] 테이블 생성/시드 중 오류: {e}")
     else:
         print("⚠️  [DB] 데이터베이스 연결 실패로 테이블 생성을 건너뜁니다.")
         print("⚠️  [DB] API는 실행되지만 데이터베이스 작업은 실패할 수 있습니다.")
-    
+
     yield
     
     # 종료 시 실행
@@ -48,6 +117,7 @@ app = FastAPI(
 # API 라우터 등록
 app.include_router(users.router, prefix="/api/v1")
 app.include_router(items.router, prefix="/api/v1")
+app.include_router(saju_api.router, prefix="/api/v1")
 
 
 @app.get("/api/data")
